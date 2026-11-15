@@ -16,6 +16,30 @@ private func fmt(_ pattern: String, _ d: Date) -> String {
     return f.string(from: d)
 }
 
+/// Soft highlight behind the panel row under the pointer. Extends a little past the
+/// content edges so the text keeps its alignment.
+struct HoverRow: ViewModifier {
+    @ObservedObject var store: Store
+    let id: String
+    func body(content: Content) -> some View {
+        content
+            .background(
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .fill(Color.primary.opacity(store.hovered == id ? 0.07 : 0))
+                    .padding(.horizontal, -12)
+                    .padding(.vertical, 2)
+            )
+            .onHover { inside in
+                if inside { store.hovered = id } else if store.hovered == id { store.hovered = nil }
+            }
+            .animation(.easeOut(duration: 0.12), value: store.hovered == id)
+    }
+}
+
+extension View {
+    func hoverRow(_ store: Store, _ id: String) -> some View { modifier(HoverRow(store: store, id: id)) }
+}
+
 struct Hairline: View {
     var body: some View { Rectangle().fill(Color.primary.opacity(0.12)).frame(height: 0.5) }
 }
@@ -41,8 +65,8 @@ struct PanelView: View {
                 row(a, snap, periodTotal: total.total)
                 Hairline()
             }
-            if let l = snap.limits {
-                quota(l)
+            if snap.limits != nil || !snap.wbQuotas.isEmpty {
+                quota(snap)
                 Hairline()
             }
             if snap.skippedZst > 0 {
@@ -76,13 +100,16 @@ struct PanelView: View {
                     VStack(spacing: 5) {
                         Text(periodNames[i])
                             .font(.system(size: 11, weight: period == i ? .semibold : .regular))
-                            .foregroundStyle(period == i ? Color.primary : Color.secondary)
+                            .foregroundStyle(period == i || store.hovered == "tab-\(i)" ? Color.primary : Color.secondary)
                         Rectangle().fill(period == i ? Color.primary : Color.clear).frame(height: 1)
                     }
                     .fixedSize()
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .onHover { inside in
+                    if inside { store.hovered = "tab-\(i)" } else if store.hovered == "tab-\(i)" { store.hovered = nil }
+                }
             }
             Spacer()
         }
@@ -162,21 +189,31 @@ struct PanelView: View {
             }
         }
         .padding(.vertical, 13)
+        .hoverRow(store, "row-\(a.rawValue)")
     }
 
-    private func quota(_ l: CodexLimits) -> some View {
+    private func quota(_ snap: Snapshot) -> some View {
         VStack(alignment: .leading, spacing: 9) {
             HStack(alignment: .firstTextBaseline, spacing: 6) {
-                Text("Codex 额度").font(.system(size: 11, weight: .medium))
-                if let p = l.plan { Text(p.uppercased()).font(.system(size: 9, weight: .semibold)).tracking(1).foregroundStyle(.tertiary) }
+                Text("订阅额度").font(.system(size: 11, weight: .medium))
+                Text("≥90% 时火焰闪红").font(.system(size: 9)).foregroundStyle(.tertiary)
                 Spacer()
-                Text("记录于 " + fmt("M/d HH:mm", Date(timeIntervalSince1970: l.t)))
-                    .font(.system(size: 10)).foregroundStyle(.tertiary)
+                if let l = snap.limits {
+                    Text("Codex 记录于 " + fmt("M/d HH:mm", Date(timeIntervalSince1970: l.t)))
+                        .font(.system(size: 10)).foregroundStyle(.tertiary)
+                }
             }
-            if let w = l.primary { Meter(w: w) }
-            if let w = l.secondary { Meter(w: w) }
+            if let l = snap.limits {
+                let plan = l.plan.map { " " + $0.uppercased() } ?? ""
+                if let w = l.primary { Meter(label: "Codex\(plan) · " + Meter.window(w.windowMin), used: w.used, resetsAt: w.resetsAt) }
+                if let w = l.secondary { Meter(label: "Codex\(plan) · " + Meter.window(w.windowMin), used: w.used, resetsAt: w.resetsAt) }
+            }
+            ForEach(snap.wbQuotas.prefix(4), id: \.name) { n in
+                Meter(label: "WorkBuddy · " + n.name, used: n.q.percent, resetsAt: n.q.resetAt)
+            }
         }
         .padding(.vertical, 13)
+        .hoverRow(store, "row-quota")
     }
 
     private var footer: some View {
@@ -233,41 +270,46 @@ struct DayStrip: View {
 }
 
 struct Meter: View {
-    let w: RateWindow
+    let label: String
+    let used: Double
+    let resetsAt: Double
 
-    private var label: String {
-        switch w.windowMin {
+    static func window(_ minutes: Int) -> String {
+        switch minutes {
         case 300: return "5 小时"
         case 10080: return "本周"
         case let m where m % 1440 == 0: return "\(m / 1440) 天"
         case let m where m % 60 == 0: return "\(m / 60) 小时"
-        default: return "\(w.windowMin) 分"
+        default: return "\(minutes) 分"
         }
     }
 
     var body: some View {
         let now = Date().timeIntervalSince1970
-        let expired = w.resetsAt > 0 && now > w.resetsAt
-        let used = expired ? 0 : w.used
-        let reset = Date(timeIntervalSince1970: w.resetsAt)
-        let resetText = expired ? "已重置"
-            : (w.resetsAt - now < 86400 ? fmt("HH:mm", reset) : fmt("EEE HH:mm", reset)) + " 重置"
-        return HStack(spacing: 10) {
-            Text(label).font(.system(size: 11)).frame(width: 40, alignment: .leading)
+        let expired = resetsAt > 0 && now > resetsAt
+        let u = expired ? 0 : used
+        let reset = Date(timeIntervalSince1970: resetsAt)
+        let cal = Calendar.current
+        let day = cal.isDateInToday(reset) ? "" : (cal.isDateInTomorrow(reset) ? "明天 " : fmt("EEE ", reset))
+        let resetText = expired ? "已重置" : day + fmt("HH:mm", reset) + " 重置"
+        let hot = u >= 90 ? Color.cinnabar : (u >= 80 ? Color.cinnabar.opacity(0.75) : Color.primary.opacity(0.65))
+        return VStack(alignment: .leading, spacing: 4) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(label).font(.system(size: 11)).lineLimit(1)
+                Spacer()
+                Text("\(Int(u.rounded()))%")
+                    .font(.system(size: 11, weight: .medium)).monospacedDigit()
+                    .foregroundStyle(u >= 80 ? Color.cinnabar : Color.primary)
+                Text(resetText).font(.system(size: 10)).foregroundStyle(.secondary).monospacedDigit()
+                    .frame(width: 78, alignment: .trailing)
+            }
             GeometryReader { g in
                 ZStack(alignment: .leading) {
                     Rectangle().fill(Color.primary.opacity(0.10))
-                    Rectangle().fill(used >= 80 ? Color.cinnabar : Color.primary.opacity(0.65))
-                        .frame(width: g.size.width * CGFloat(min(1, used / 100)))
+                    Rectangle().fill(hot).frame(width: g.size.width * CGFloat(min(1, u / 100)))
                 }
             }
             .frame(height: 2)
-            Text("\(Int(used.rounded()))%")
-                .font(.system(size: 11, weight: .medium)).monospacedDigit()
-                .foregroundStyle(used >= 80 ? Color.cinnabar : Color.primary)
-                .frame(width: 36, alignment: .trailing)
-            Text(resetText).font(.system(size: 10)).foregroundStyle(.secondary).monospacedDigit()
-                .frame(width: 78, alignment: .trailing)
         }
     }
 }

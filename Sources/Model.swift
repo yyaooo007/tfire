@@ -39,6 +39,18 @@ struct CodexLimits: Codable, Sendable {
     var plan: String?
 }
 
+/// A subscription quota as WorkBuddy reports it per model: percent used, resets at.
+struct ModelQuota: Codable, Sendable {
+    var t: Double
+    var percent: Double
+    var resetAt: Double
+}
+
+struct NamedQuota: Sendable {
+    var name: String
+    var q: ModelQuota
+}
+
 struct FileState: Codable, Sendable {
     var agent: Agent
     var path: String
@@ -50,10 +62,11 @@ struct FileState: Codable, Sendable {
     var codexModel: String?
     var codexPrevTotal: Int?
     var limits: CodexLimits?
+    var quotas: [String: ModelQuota]?
 }
 
 struct Cache: Codable, Sendable {
-    static let currentVersion = 1
+    static let currentVersion = 2
     var version = Cache.currentVersion
     var files: [String: FileState] = [:]
 }
@@ -82,6 +95,7 @@ struct Snapshot: Sendable {
     var dailyMax = 0          // biggest single agent-day in 30 days (shared bar scale)
     var dailyTotalMax = 0     // biggest all-agent day in 30 days (menu-bar water level)
     var scanSeconds = 0.0
+    var wbQuotas: [NamedQuota] = []   // WorkBuddy per-model quotas still inside their window
 
     func total(_ p: Int) -> Breakdown {
         var b = Breakdown()
@@ -95,6 +109,7 @@ func aggregate(_ cache: Cache, now: Date = Date()) -> Snapshot {
     let todayStart = Calendar.current.startOfDay(for: now).timeIntervalSince1970
     var snap = Snapshot()
     var deduped: [String: (Int, Rec)] = [:]
+    var wbLatest: [String: ModelQuota] = [:]
 
     func add(_ a: Int, _ r: Rec) {
         let dayAgo = r.t >= todayStart ? 0 : Int((todayStart - r.t) / 86400) + 1
@@ -130,6 +145,7 @@ func aggregate(_ cache: Cache, now: Date = Date()) -> Snapshot {
             }
         }
         if let l = st.limits, l.t > (snap.limits?.t ?? 0) { snap.limits = l }
+        for (m, q) in st.quotas ?? [:] where q.t > (wbLatest[m]?.t ?? 0) { wbLatest[m] = q }
     }
     for (a, r) in deduped.values { add(a, r) }
 
@@ -141,8 +157,31 @@ func aggregate(_ cache: Cache, now: Date = Date()) -> Snapshot {
         }
     }
     snap.dailyTotalMax = dayTotals.max() ?? 0
+    let nowT = now.timeIntervalSince1970
+    snap.wbQuotas = wbLatest.filter { $0.value.resetAt > nowT }
+        .map { NamedQuota(name: $0.key, q: $0.value) }
+        .sorted { $0.q.percent > $1.q.percent }
     snap.updated = now
     return snap
+}
+
+// MARK: - Subscription alerts
+
+/// Every quota window that is at or above `threshold` percent right now, as a stable key
+/// (agent + window + reset time), so each crossing alerts once.
+func quotaAlerts(_ s: Snapshot, threshold: Double = 90, now: Date = Date()) -> [String] {
+    let t = now.timeIntervalSince1970
+    var keys: [String] = []
+    if let l = s.limits {
+        for w in [l.primary, l.secondary].compactMap({ $0 }) where w.resetsAt > t && w.used >= threshold {
+            // Codex nudges resets_at by a second or two between events; bucket to the hour.
+            keys.append("codex-\(w.windowMin)-\(Int(w.resetsAt / 3600))")
+        }
+    }
+    for n in s.wbQuotas where n.q.percent >= threshold {
+        keys.append("wb-\(n.name)-\(Int(n.q.resetAt / 3600))")
+    }
+    return keys
 }
 
 // MARK: - Formatting (万 / 亿)

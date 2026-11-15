@@ -26,9 +26,13 @@ final class Scanner: @unchecked Sendable {
             try? fm.moveItem(at: old, to: cacheURL)
         }
         if let d = try? Data(contentsOf: cacheURL),
-           let c = try? JSONDecoder().decode(Cache.self, from: d),
-           c.version == Cache.currentVersion {
-            cache = c
+           var c = try? JSONDecoder().decode(Cache.self, from: d) {
+            if c.version == 1 {
+                // v2 also reads WorkBuddy quotas: re-read only the WorkBuddy sessions.
+                c.files = c.files.filter { $0.value.agent != .workbuddy }
+                c.version = Cache.currentVersion
+            }
+            if c.version == Cache.currentVersion { cache = c }
         }
         zstdPath = ["/opt/homebrew/bin/zstd", "/usr/local/bin/zstd", "/usr/bin/zstd"]
             .first { FileManager.default.isExecutableFile(atPath: $0) }
@@ -123,7 +127,8 @@ final class Scanner: @unchecked Sendable {
                 }
             }
             var st = FileState(agent: c.agent, path: c.path, size: size, mtime: mtime, offset: 0,
-                               recs: [], fromZst: c.zst, codexModel: nil, codexPrevTotal: nil, limits: nil)
+                               recs: [], fromZst: c.zst, codexModel: nil, codexPrevTotal: nil, limits: nil,
+                               quotas: nil)
             if c.zst {
                 guard let z = zstdPath, let data = decompress(z, c.path) else { skipped += 1; continue }
                 st.offset = Int64(parse(&st, data))
@@ -257,6 +262,16 @@ final class Scanner: @unchecked Sendable {
             var ts = st.mtime
             if let n = o["timestamp"] as? NSNumber { ts = n.doubleValue / 1000 }
             else if let s = o["timestamp"] as? String, let t = parseISO(s) { ts = t }
+            if let q = (pd["rawUsage"] as? [String: Any])?["quota"] as? [String: Any], let m = q["model"] as? String {
+                let reset = (q["reset_at"] as? NSNumber)?.doubleValue ?? Double(q["reset_at"] as? String ?? "") ?? 0
+                if reset > 0 {
+                    var all = st.quotas ?? [:]
+                    if ts >= (all[m]?.t ?? 0) {
+                        all[m] = ModelQuota(t: ts, percent: (q["percent"] as? NSNumber)?.doubleValue ?? 0, resetAt: reset)
+                    }
+                    st.quotas = all
+                }
+            }
             let r = Rec(t: ts, m: pd["model"] as? String ?? "?", i: max(0, inp - cached), cr: cached, cw: 0,
                         o: out, id: (pd["messageId"] as? String).map { "wb:" + $0 })
             if r.total > 0 { st.recs.append(r) }
