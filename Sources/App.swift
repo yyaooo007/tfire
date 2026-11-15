@@ -11,6 +11,10 @@ enum Main {
             Report.run(to: args[i + 1])
             return
         }
+        if let i = args.firstIndex(of: "--iconset"), i + 1 < args.count {
+            IconMaker.run(dir: args[i + 1])
+            return
+        }
         if let i = args.firstIndex(of: "--snapshot"), i + 1 < args.count {
             Snapshotter.run(dir: args[i + 1])
             return
@@ -347,6 +351,78 @@ func iconComparison() -> NSImage? {
     }
     out.unlockFocus()
     return out
+}
+
+// MARK: - App icon (Finder / DMG / Dock-less, but Finder and the DMG show it)
+
+/// The menu-bar flame, enlarged: white outline on a near-black squircle, burning cinnabar
+/// inside up to just past half — the same glyph you see in the menu bar, given a body.
+func drawAppIcon(_ s: CGFloat) {
+    let m = s * 100 / 1024
+    let body = NSRect(x: m, y: m, width: s - 2 * m, height: s - 2 * m)
+    let r = s * 185 / 1024
+    let bg = NSBezierPath(roundedRect: body, xRadius: r, yRadius: r)
+    NSGradient(starting: NSColor(white: 0.16, alpha: 1), ending: NSColor(white: 0.05, alpha: 1))?.draw(in: bg, angle: -90)
+
+    let h = s * 0.56, k = h / 17, w = 11 * k
+    let ox = (s - w) / 2, oy = (s - h) / 2 - s * 0.01
+    func pt(_ x: CGFloat, _ y: CGFloat) -> NSPoint { NSPoint(x: ox + x * k, y: oy + y * k) }
+    let p = NSBezierPath()
+    func c(_ x1: CGFloat, _ y1: CGFloat, _ x2: CGFloat, _ y2: CGFloat, _ x: CGFloat, _ y: CGFloat) {
+        p.curve(to: pt(x, y), controlPoint1: pt(x1, y1), controlPoint2: pt(x2, y2))
+    }
+    p.move(to: pt(5.5, 0.8))
+    c(8.3, 0.8, 10.0, 2.9, 10.0, 5.7)
+    c(10.0, 9.6, 6.6, 11.6, 6.6, 16.2)
+    c(5.6, 14.0, 4.4, 12.6, 4.5, 10.2)
+    c(3.7, 11.2, 2.9, 12.0, 2.7, 13.2)
+    c(1.4, 11.0, 1.0, 8.2, 1.0, 5.7)
+    c(1.0, 2.9, 2.7, 0.8, 5.5, 0.8)
+    p.close()
+
+    NSGraphicsContext.saveGraphicsState()
+    p.addClip()
+    let top = 0.8 + 15.8 * 0.55
+    let f = NSBezierPath()
+    f.move(to: pt(0, 0)); f.line(to: pt(11, 0))
+    var x: CGFloat = 11
+    while x >= 0 {
+        f.line(to: pt(x, CGFloat(top + 0.55 * sin(Double(x) * 1.5 + 0.8) + 0.3 * sin(Double(x) * 2.9 - 0.4))))
+        x -= 0.25
+    }
+    f.close()
+    NSColor(red: 0.84, green: 0.24, blue: 0.16, alpha: 1).setFill()
+    f.fill()
+    NSGraphicsContext.restoreGraphicsState()
+
+    NSColor.white.setStroke()
+    p.lineWidth = max(1, k * 0.8)
+    p.lineJoinStyle = .round
+    p.stroke()
+}
+
+enum IconMaker {
+    static func run(dir: String) {
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let specs: [(String, Int)] = [
+            ("icon_16x16", 16), ("icon_16x16@2x", 32), ("icon_32x32", 32), ("icon_32x32@2x", 64),
+            ("icon_128x128", 128), ("icon_128x128@2x", 256), ("icon_256x256", 256),
+            ("icon_256x256@2x", 512), ("icon_512x512", 512), ("icon_512x512@2x", 1024),
+        ]
+        for (name, px) in specs {
+            guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: px, pixelsHigh: px,
+                                             bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+                                             isPlanar: false, colorSpaceName: .deviceRGB,
+                                             bytesPerRow: 0, bitsPerPixel: 0) else { continue }
+            NSGraphicsContext.saveGraphicsState()
+            NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+            drawAppIcon(CGFloat(px))
+            NSGraphicsContext.restoreGraphicsState()
+            if let png = rep.representation(using: .png, properties: [:]) {
+                try? png.write(to: URL(fileURLWithPath: dir).appendingPathComponent(name + ".png"))
+            }
+        }
+    }
 }
 
 // MARK: - Self-check report (used by the installer)
