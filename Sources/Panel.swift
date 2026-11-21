@@ -65,7 +65,7 @@ struct PanelView: View {
                 row(a, snap, periodTotal: total.total)
                 Hairline()
             }
-            if snap.limits != nil || !snap.wbQuotas.isEmpty {
+            if snap.limits != nil || !snap.wbQuotas.isEmpty || snap.gemini.overQuotaModes != nil {
                 quota(snap)
                 Hairline()
             }
@@ -141,6 +141,9 @@ struct PanelView: View {
         let v = st.periods[period].total
         let share = periodTotal > 0 ? Double(v) / Double(periodTotal) : 0
         let open = store.expanded == a
+        // Gemini desktop app: no local token data, show real message / chat counts instead.
+        let gApp = a == .gemini && st.periods[3].total == 0 && snap.gemini.found
+        let g = snap.gemini
         return VStack(alignment: .leading, spacing: 9) {
             Button {
                 store.expanded = open ? nil : a
@@ -152,7 +155,11 @@ struct PanelView: View {
                             .font(.system(size: 10)).foregroundStyle(.tertiary).monospacedDigit()
                     }
                     Spacer()
-                    if st.periods[3].total == 0 {
+                    if gApp {
+                        Text("\(g.msgs[period]) 条消息 · \(g.chats[period]) 个对话")
+                            .font(.system(size: 13, weight: .medium)).monospacedDigit()
+                            .foregroundStyle(g.msgs[period] > 0 ? Color.primary : Color.secondary)
+                    } else if st.periods[3].total == 0 {
                         Text(a == .claude ? "本机没有记录 · 云端会话不落本地" : "本机没有记录")
                             .font(.system(size: 11)).foregroundStyle(.tertiary)
                     } else {
@@ -167,6 +174,11 @@ struct PanelView: View {
 
             if st.periods[3].total > 0 {
                 DayStrip(values: st.daily, scale: snap.dailyMax, span: span)
+            } else if gApp {
+                // messages, on their own scale (not comparable with tokens)
+                DayStrip(values: g.daily, scale: g.daily.max() ?? 1, span: span)
+                Text("桌面 App 的 token 记在 Google 服务器上，本机只有消息和对话数")
+                    .font(.system(size: 9.5)).foregroundStyle(.tertiary)
             }
 
             if open {
@@ -210,6 +222,18 @@ struct PanelView: View {
             }
             ForEach(snap.wbQuotas.prefix(4), id: \.name) { n in
                 Meter(label: "WorkBuddy · " + n.name, used: n.q.percent, resetsAt: n.q.resetAt)
+            }
+            if let n = snap.gemini.overQuotaModes {
+                HStack(alignment: .firstTextBaseline) {
+                    Text("Gemini 桌面 App").font(.system(size: 11))
+                    Spacer()
+                    Text(n > 0 ? "\(n) 个模式已超额" : "未超额")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(n > 0 ? Color.cinnabar : Color.primary)
+                    Text("记录于 " + fmt("M/d HH:mm", Date(timeIntervalSince1970: snap.gemini.quotaT)))
+                        .font(.system(size: 10)).foregroundStyle(.secondary)
+                        .frame(width: 78 + 22, alignment: .trailing)
+                }
             }
         }
         .padding(.vertical, 13)

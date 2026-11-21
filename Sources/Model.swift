@@ -1,16 +1,16 @@
 import Foundation
 
 enum Agent: String, Codable, CaseIterable, Identifiable, Sendable {
-    case claude, codex, workbuddy
+    case claude, codex, workbuddy, gemini
     var id: Self { self }
     var idx: Int {
-        switch self { case .claude: return 0; case .codex: return 1; case .workbuddy: return 2 }
+        switch self { case .claude: return 0; case .codex: return 1; case .workbuddy: return 2; case .gemini: return 3 }
     }
     var title: String {
-        switch self { case .claude: return "Claude"; case .codex: return "Codex"; case .workbuddy: return "WorkBuddy" }
+        switch self { case .claude: return "Claude"; case .codex: return "Codex"; case .workbuddy: return "WorkBuddy"; case .gemini: return "Gemini" }
     }
     var short: String {
-        switch self { case .claude: return "Cl"; case .codex: return "Cx"; case .workbuddy: return "WB" }
+        switch self { case .claude: return "Cl"; case .codex: return "Cx"; case .workbuddy: return "WB"; case .gemini: return "Gm" }
     }
 }
 
@@ -49,6 +49,25 @@ struct ModelQuota: Codable, Sendable {
 struct NamedQuota: Sendable {
     var name: String
     var q: ModelQuota
+}
+
+/// One message in the Gemini desktop app. The app keeps message bodies encrypted and its
+/// token usage on Google's servers, so only counts and times are available locally.
+struct GMsg: Sendable {
+    var t: Double
+    var user: Bool
+    var chat: String
+}
+
+/// Gemini desktop app activity: messages and chats per period, and the app's own
+/// over-quota flag from its log.
+struct GeminiActivity: Sendable {
+    var found = false
+    var msgs = [Int](repeating: 0, count: 4)
+    var chats = [Int](repeating: 0, count: 4)
+    var daily = [Int](repeating: 0, count: 30)
+    var overQuotaModes: Int?
+    var quotaT: Double = 0
 }
 
 struct FileState: Codable, Sendable {
@@ -96,6 +115,7 @@ struct Snapshot: Sendable {
     var dailyTotalMax = 0     // biggest all-agent day in 30 days (menu-bar water level)
     var scanSeconds = 0.0
     var wbQuotas: [NamedQuota] = []   // WorkBuddy per-model quotas still inside their window
+    var gemini = GeminiActivity()
 
     func total(_ p: Int) -> Breakdown {
         var b = Breakdown()
@@ -105,7 +125,8 @@ struct Snapshot: Sendable {
     var isEmpty: Bool { total(3).total == 0 }
 }
 
-func aggregate(_ cache: Cache, now: Date = Date()) -> Snapshot {
+func aggregate(_ cache: Cache, gemini: [GMsg]? = nil, geminiQuota: (Int, Double)? = nil,
+               now: Date = Date()) -> Snapshot {
     let todayStart = Calendar.current.startOfDay(for: now).timeIntervalSince1970
     var snap = Snapshot()
     var deduped: [String: (Int, Rec)] = [:]
@@ -161,6 +182,24 @@ func aggregate(_ cache: Cache, now: Date = Date()) -> Snapshot {
     snap.wbQuotas = wbLatest.filter { $0.value.resetAt > nowT }
         .map { NamedQuota(name: $0.key, q: $0.value) }
         .sorted { $0.q.percent > $1.q.percent }
+
+    if let msgs = gemini {
+        var g = GeminiActivity()
+        g.found = true
+        var chatSets = [Set<String>](repeating: [], count: 4)
+        for m in msgs {
+            let dayAgo = m.t >= todayStart ? 0 : Int((todayStart - m.t) / 86400) + 1
+            let periods = [dayAgo == 0, dayAgo < 7, dayAgo < 30, true]
+            for p in 0..<4 where periods[p] {
+                g.msgs[p] += 1
+                chatSets[p].insert(m.chat)
+            }
+            if dayAgo < 30 { g.daily[29 - dayAgo] += 1 }
+        }
+        g.chats = chatSets.map(\.count)
+        if let q = geminiQuota { g.overQuotaModes = q.0; g.quotaT = q.1 }
+        snap.gemini = g
+    }
     snap.updated = now
     return snap
 }
@@ -180,6 +219,10 @@ func quotaAlerts(_ s: Snapshot, threshold: Double = 90, now: Date = Date()) -> [
     }
     for n in s.wbQuotas where n.q.percent >= threshold {
         keys.append("wb-\(n.name)-\(Int(n.q.resetAt / 3600))")
+    }
+    // The Gemini app only says "over quota" or not; once per day at most.
+    if let n = s.gemini.overQuotaModes, n > 0, t - s.gemini.quotaT < 6 * 3600 {
+        keys.append("gemini-over-\(Int(s.gemini.quotaT / 86400))")
     }
     return keys
 }

@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import SQLite3
 
 /// Reads the session logs each agent already writes on this Mac. Read-only; never touches
 /// the network, the Keychain or the agents' own files. Incremental: remembers how far into
@@ -82,6 +83,15 @@ final class Scanner: @unchecked Sendable {
                 }
             }
         }
+        // Gemini CLI: ~/.gemini/tmp/<project>/chats/session-*.json (whole JSON, re-read on change)
+        let gtmp = home.appendingPathComponent(".gemini/tmp").path
+        for d in (try? fm.contentsOfDirectory(atPath: gtmp)) ?? [] {
+            let chats = gtmp + "/" + d + "/chats"
+            for f in (try? fm.contentsOfDirectory(atPath: chats)) ?? [] where f.hasSuffix(".json") {
+                let p = chats + "/" + f
+                out.append(Candidate(agent: .gemini, path: p, key: p, zst: false))
+            }
+        }
         // WorkBuddy: ~/.workbuddy/projects/<project>/<session>.jsonl
         let wb = home.appendingPathComponent(".workbuddy/projects").path
         for d in (try? fm.contentsOfDirectory(atPath: wb)) ?? [] {
@@ -111,6 +121,14 @@ final class Scanner: @unchecked Sendable {
             let size = (attrs[.size] as? NSNumber)?.int64Value ?? 0
             let mtime = (attrs[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
 
+            if c.agent == .gemini {
+                if let st = cache.files[c.key], st.size == size, st.mtime == mtime { continue }
+                var st = FileState(agent: .gemini, path: c.path, size: size, mtime: mtime, offset: 0, recs: [],
+                                   fromZst: false, codexModel: nil, codexPrevTotal: nil, limits: nil, quotas: nil)
+                parseGeminiCLI(&st)
+                cache.files[c.key] = st; changed = true
+                continue
+            }
             if var st = cache.files[c.key] {
                 if st.path == c.path && st.size == size && st.mtime == mtime { continue }
                 if c.zst && st.path != c.path && !st.fromZst {
@@ -275,7 +293,96 @@ final class Scanner: @unchecked Sendable {
             let r = Rec(t: ts, m: pd["model"] as? String ?? "?", i: max(0, inp - cached), cr: cached, cw: 0,
                         o: out, id: (pd["messageId"] as? String).map { "wb:" + $0 })
             if r.total > 0 { st.recs.append(r) }
+
+        case .gemini:
+            return   // Gemini CLI files are whole JSON documents, read by parseGeminiCLI
         }
+    }
+
+    /// Gemini CLI session file: {"messages":[{"timestamp","model","tokens":{input,output,cached,thoughts,tool,total}}]}
+    private func parseGeminiCLI(_ st: inout FileState) {
+        guard let d = fm.contents(atPath: st.path),
+              let o = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
+              let msgs = o["messages"] as? [[String: Any]] else { return }
+        for m in msgs {
+            guard let tk = m["tokens"] as? [String: Any] else { continue }
+            let inp = int(tk["input"]), cached = int(tk["cached"])
+            let r = Rec(t: parseISO(m["timestamp"] as? String) ?? st.mtime, m: m["model"] as? String ?? "gemini",
+                        i: max(0, inp - cached) + int(tk["tool"]), cr: cached, cw: 0,
+                        o: int(tk["output"]) + int(tk["thoughts"]), id: (m["id"] as? String).map { "gm:" + $0 })
+            if r.total > 0 { st.recs.append(r) }
+        }
+        st.offset = Int64(d.count)
+    }
+
+    // MARK: Gemini desktop app (counts only)
+
+    private var geminiCache: (sig: String, msgs: [GMsg])?
+
+    /// Messages from the Gemini app's local chat index (Core Data SQLite under Caches). The
+    /// database is copied first so the app's own writes are never disturbed. nil = app not found.
+    func geminiAppMessages() -> [GMsg]? {
+        let base = home.appendingPathComponent("Library/Caches/com.google.GeminiMacOS/Gemini").path
+        guard let users = try? fm.contentsOfDirectory(atPath: base) else { return nil }
+        let stores = users.map { base + "/" + $0 + "/ChatInfo2.store" }.filter { fm.fileExists(atPath: $0) }
+        guard !stores.isEmpty else { return nil }
+        let sig = stores.flatMap { s in [s, s + "-wal"].map { p -> String in
+            let a = try? fm.attributesOfItem(atPath: p)
+            return "\((a?[.size] as? NSNumber)?.int64Value ?? 0)-\((a?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0)"
+        } }.joined(separator: "|")
+        if let c = geminiCache, c.sig == sig { return c.msgs }
+
+        var out: [GMsg] = []
+        let tmp = NSTemporaryDirectory() + "tfire-gemini"
+        for (k, s) in stores.enumerated() {
+            let dir = tmp + "/\(k)"
+            try? fm.removeItem(atPath: dir)
+            try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            for suffix in ["", "-wal", "-shm"] where fm.fileExists(atPath: s + suffix) {
+                try? fm.copyItem(atPath: s + suffix, toPath: dir + "/c.store" + suffix)
+            }
+            var db: OpaquePointer?
+            guard sqlite3_open_v2(dir + "/c.store", &db, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK else {
+                sqlite3_close(db); continue
+            }
+            var stmt: OpaquePointer?
+            let q = "SELECT ZCREATEDTIME, ZISUSERTURN, ZCHATUUID FROM ZCHATMESSAGESTOREDMODEL"
+            if sqlite3_prepare_v2(db, q, -1, &stmt, nil) == SQLITE_OK {
+                while sqlite3_step(stmt) == SQLITE_ROW {
+                    let t = sqlite3_column_double(stmt, 0) + 978_307_200      // Core Data epoch → Unix
+                    let chat = sqlite3_column_text(stmt, 2).map { String(cString: $0) } ?? ""
+                    out.append(GMsg(t: t, user: sqlite3_column_int(stmt, 1) != 0, chat: chat))
+                }
+            }
+            sqlite3_finalize(stmt)
+            sqlite3_close(db)
+        }
+        geminiCache = (sig, out)
+        return out
+    }
+
+    /// Latest "Quota info updated, N modes over quota" line from the Gemini app's logs.
+    func geminiQuota() -> (Int, Double)? {
+        let dir = home.appendingPathComponent("Library/Caches/com.google.GeminiMacOS/Logs").path
+        guard let names = try? fm.contentsOfDirectory(atPath: dir) else { return nil }
+        let logs = names.filter { $0.hasPrefix("diagnostic") && $0.hasSuffix(".log") }.sorted().suffix(4)
+        let f = DateFormatter()
+        f.dateFormat = "yyyyMMdd-HHmmss.SSS"
+        var best: (Int, Double)?
+        for name in logs {
+            guard let fh = FileHandle(forReadingAtPath: dir + "/" + name) else { continue }
+            let size = (try? fh.seekToEnd()) ?? 0
+            try? fh.seek(toOffset: size > 400_000 ? size - 400_000 : 0)
+            let text = String(decoding: (try? fh.readToEnd()) ?? Data(), as: UTF8.self)
+            try? fh.close()
+            for line in text.split(separator: "\n") where line.contains("modes over quota") {
+                guard let r = line.range(of: "Quota info updated, ") else { continue }
+                let n = Int(line[r.upperBound...].prefix { $0.isNumber }) ?? 0
+                let t = f.date(from: String(line.prefix(19)))?.timeIntervalSince1970 ?? 0
+                if t >= (best?.1 ?? 0) { best = (n, t) }
+            }
+        }
+        return best
     }
 
     private func window(_ a: Any?) -> RateWindow? {

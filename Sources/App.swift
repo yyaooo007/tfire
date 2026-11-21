@@ -60,12 +60,13 @@ final class Store: ObservableObject {
         let scanner = self.scanner
         Task.detached(priority: .utility) {
             scanner.scan()
-            var s = aggregate(scanner.cache)
+            var s = aggregate(scanner.cache, gemini: scanner.geminiAppMessages(), geminiQuota: scanner.geminiQuota())
             s.skippedZst = scanner.skippedZst
             s.scanSeconds = scanner.lastScanSeconds
             let result = s
             await MainActor.run {
-                if !self.indexing, result.total(3).total > self.snap.total(3).total {
+                if !self.indexing, result.total(3).total > self.snap.total(3).total
+                    || result.gemini.msgs[3] > self.snap.gemini.msgs[3] {
                     self.burningUntil = Date().addingTimeInterval(8)
                 }
                 self.snap = result
@@ -77,6 +78,12 @@ final class Store: ObservableObject {
     }
 
     func saveNow() { scanner.save() }
+
+    /// Offline snapshots: fill in the Gemini app counts synchronously.
+    func applyGeminiForSnapshot() {
+        snap = aggregate(scanner.cache, gemini: scanner.geminiAppMessages(), geminiQuota: scanner.geminiQuota())
+        indexing = false
+    }
 }
 
 // MARK: - Menu bar
@@ -113,7 +120,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // React within a second or two when any agent writes to its logs.
         let home = NSHomeDirectory()
         watcher = FSWatcher(paths: [home + "/.claude/projects", home + "/.codex/sessions",
-                                    home + "/.workbuddy/projects"]) { [weak self] in
+                                    home + "/.workbuddy/projects", home + "/.gemini/tmp",
+                                    home + "/Library/Caches/com.google.GeminiMacOS/Gemini"]) { [weak self] in
             self?.store.refresh()
         }
     }
@@ -438,7 +446,9 @@ enum Report {
         s.scan(forceSave: true)
         let second = Date().timeIntervalSince(t1)
         let t2 = Date()
-        let snap = aggregate(s.cache)
+        let gm = s.geminiAppMessages()
+        let gq = s.geminiQuota()
+        let snap = aggregate(s.cache, gemini: gm, geminiQuota: gq)
         let aggT = Date().timeIntervalSince(t2)
 
         var out = "Tfire 自检报告 \(Date())\n"
@@ -458,6 +468,10 @@ enum Report {
             out += "  30日模型: " + top.map { "\($0.key)=\($0.value)" }.joined(separator: ", ") + "\n"
             out += "  近7天: " + st.daily.suffix(7).map(String.init).joined(separator: " ") + "\n\n"
         }
+        let g = snap.gemini
+        out += "[Gemini 桌面 App] \(g.found ? "找到" : "未找到")  消息 今日/7日/30日/累计: \(g.msgs.map(String.init).joined(separator: "/"))  对话: \(g.chats.map(String.init).joined(separator: "/"))\n"
+        out += "  近7天消息: " + g.daily.suffix(7).map(String.init).joined(separator: " ") + "\n"
+        out += "  额度: " + (g.overQuotaModes.map { "\($0) 个模式超额，记录于 \(Date(timeIntervalSince1970: g.quotaT))" } ?? "日志里没有") + "\n\n"
         // Claude diagnostics: where the files are and what their usage lines look like.
         let fm = FileManager.default
         out += "Claude 目录: ~/.claude/projects \(fm.fileExists(atPath: s.home.path + "/.claude/projects") ? "存在" : "不存在")"
@@ -496,11 +510,13 @@ enum Report {
 enum Snapshotter {
     static func run(dir: String) {
         let store = Store()           // reads the cache built by --report
+        store.applyGeminiForSnapshot()
         let variants: [(String, ColorScheme, Int, Agent?)] = [
             ("panel-light-today", .light, 0, nil),
             ("panel-dark-today", .dark, 0, nil),
             ("panel-light-30d-open", .light, 2, .workbuddy),
             ("panel-light-hover", .light, 0, nil),
+            ("panel-light-7d", .light, 1, nil),
         ]
         for (name, scheme, period, open) in variants {
             store.period = period
