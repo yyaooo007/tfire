@@ -106,6 +106,25 @@ struct AgentStat: Sendable {
     var files = 0
 }
 
+/// Everything about one calendar day (local time), for the 按日 view.
+struct DayStat: Sendable {
+    var stats = [Breakdown](repeating: Breakdown(), count: Agent.allCases.count)
+    var models = [[String: Int]](repeating: [:], count: Agent.allCases.count)
+    var gMsgs = 0
+    var gChats = 0
+    var total: Int { stats.reduce(0) { $0 + $1.total } }
+}
+
+/// Local-day index: days since 1970-01-01 in the Mac's current time zone.
+func dayKey(_ t: Double, offset: Double = Double(TimeZone.current.secondsFromGMT())) -> Int {
+    Int(((t + offset) / 86400).rounded(.down))
+}
+
+/// Start of a local day, back as a Date.
+func dayDate(_ key: Int) -> Date {
+    Date(timeIntervalSince1970: Double(key) * 86400 - Double(TimeZone.current.secondsFromGMT()))
+}
+
 struct Snapshot: Sendable {
     var stats = [AgentStat](repeating: AgentStat(), count: Agent.allCases.count)
     var limits: CodexLimits?
@@ -116,6 +135,9 @@ struct Snapshot: Sendable {
     var scanSeconds = 0.0
     var wbQuotas: [NamedQuota] = []   // WorkBuddy per-model quotas still inside their window
     var gemini = GeminiActivity()
+    var days: [Int: DayStat] = [:]    // every day that has any record
+    var todayKey = 0
+    var firstDay: Int?                // earliest day with a record
 
     func total(_ p: Int) -> Breakdown {
         var b = Breakdown()
@@ -129,6 +151,8 @@ func aggregate(_ cache: Cache, gemini: [GMsg]? = nil, geminiQuota: (Int, Double)
                now: Date = Date()) -> Snapshot {
     let todayStart = Calendar.current.startOfDay(for: now).timeIntervalSince1970
     var snap = Snapshot()
+    let off = Double(TimeZone.current.secondsFromGMT())
+    snap.todayKey = dayKey(now.timeIntervalSince1970, offset: off)
     var deduped: [String: (Int, Rec)] = [:]
     var wbLatest: [String: ModelQuota] = [:]
 
@@ -150,6 +174,9 @@ func aggregate(_ cache: Cache, gemini: [GMsg]? = nil, geminiQuota: (Int, Double)
             snap.stats[a].periods[0].add(r)
             snap.stats[a].models[0][r.m, default: 0] += v
         }
+        let k = dayKey(r.t, offset: off)
+        snap.days[k, default: DayStat()].stats[a].add(r)
+        snap.days[k, default: DayStat()].models[a][r.m, default: 0] += v
     }
 
     for st in cache.files.values {
@@ -178,6 +205,7 @@ func aggregate(_ cache: Cache, gemini: [GMsg]? = nil, geminiQuota: (Int, Double)
         }
     }
     snap.dailyTotalMax = dayTotals.max() ?? 0
+    snap.firstDay = snap.days.keys.min()
     let nowT = now.timeIntervalSince1970
     snap.wbQuotas = wbLatest.filter { $0.value.resetAt > nowT }
         .map { NamedQuota(name: $0.key, q: $0.value) }
@@ -187,7 +215,11 @@ func aggregate(_ cache: Cache, gemini: [GMsg]? = nil, geminiQuota: (Int, Double)
         var g = GeminiActivity()
         g.found = true
         var chatSets = [Set<String>](repeating: [], count: 4)
+        var dayChats: [Int: Set<String>] = [:]
         for m in msgs {
+            let k = dayKey(m.t, offset: off)
+            snap.days[k, default: DayStat()].gMsgs += 1
+            dayChats[k, default: []].insert(m.chat)
             let dayAgo = m.t >= todayStart ? 0 : Int((todayStart - m.t) / 86400) + 1
             let periods = [dayAgo == 0, dayAgo < 7, dayAgo < 30, true]
             for p in 0..<4 where periods[p] {
@@ -197,6 +229,7 @@ func aggregate(_ cache: Cache, gemini: [GMsg]? = nil, geminiQuota: (Int, Double)
             if dayAgo < 30 { g.daily[29 - dayAgo] += 1 }
         }
         g.chats = chatSets.map(\.count)
+        for (k, set) in dayChats { snap.days[k, default: DayStat()].gChats = set.count }
         if let q = geminiQuota { g.overQuotaModes = q.0; g.quotaT = q.1 }
         snap.gemini = g
     }

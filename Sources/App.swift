@@ -40,6 +40,8 @@ final class Store: ObservableObject {
     @Published var expanded: Agent?
     @Published var loginOn = SMAppService.mainApp.status == .enabled
     @Published var hovered: String?          // id of the panel row under the pointer
+    @Published var selectedDay: Int?         // 按日 view; nil = today
+    @Published var scrub: (agent: Agent, day: Int)?   // day bar under the pointer
     /// Tokens went up in the last scan → the flame burns until this moment.
     var burningUntil = Date.distantPast
     var onChange: (() -> Void)?
@@ -435,6 +437,10 @@ enum IconMaker {
 
 // MARK: - Self-check report (used by the installer)
 
+func fmtDay(_ k: Int) -> String {
+    let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"; return f.string(from: dayDate(k))
+}
+
 enum Report {
     static func run(to path: String) {
         let s = Scanner()
@@ -468,6 +474,19 @@ enum Report {
             out += "  30日模型: " + top.map { "\($0.key)=\($0.value)" }.joined(separator: ", ") + "\n"
             out += "  近7天: " + st.daily.suffix(7).map(String.init).joined(separator: " ") + "\n\n"
         }
+        // Records kept from files that no longer exist (agents delete some session files later).
+        var gone: [Agent: Int] = [:]
+        var goneDays: [Int: [String: Int]] = [:]
+        for st in s.cache.files.values where !FileManager.default.fileExists(atPath: st.path) {
+            gone[st.agent, default: 0] += 1
+            for r in st.recs { goneDays[dayKey(r.t), default: [:]][r.m, default: 0] += r.total }
+        }
+        out += "已不在磁盘上的会话文件: " + gone.map { "\($0.key.title) \($0.value)" }.joined(separator: ", ") + "\n"
+        for k in goneDays.keys.sorted().suffix(12) {
+            let m = goneDays[k]!.sorted { $0.value > $1.value }.prefix(3).map { "\($0.key)=\($0.value)" }.joined(separator: " ")
+            out += "  " + fmtDay(k) + " 来自已删文件: \(goneDays[k]!.values.reduce(0, +))  \(m)\n"
+        }
+        out += "\n"
         let g = snap.gemini
         out += "[Gemini 桌面 App] \(g.found ? "找到" : "未找到")  消息 今日/7日/30日/累计: \(g.msgs.map(String.init).joined(separator: "/"))  对话: \(g.chats.map(String.init).joined(separator: "/"))\n"
         out += "  近7天消息: " + g.daily.suffix(7).map(String.init).joined(separator: " ") + "\n"
@@ -517,11 +536,16 @@ enum Snapshotter {
             ("panel-light-30d-open", .light, 2, .workbuddy),
             ("panel-light-hover", .light, 0, nil),
             ("panel-light-7d", .light, 1, nil),
+            ("panel-light-day", .light, 4, nil),
         ]
         for (name, scheme, period, open) in variants {
             store.period = period
             store.expanded = open
             store.hovered = name.hasSuffix("hover") ? "row-codex" : nil
+            // 按日 sample: the busiest day of the last 30, so the frame shows real numbers
+            store.selectedDay = name.hasSuffix("day")
+                ? (store.snap.days.filter { $0.key > store.snap.todayKey - 30 }.max { $0.value.total < $1.value.total }?.key)
+                : nil
             let view = PanelView(store: store)
                 .background(scheme == .dark ? Color(white: 0.16) : Color(white: 0.97))
                 .environment(\.colorScheme, scheme)
